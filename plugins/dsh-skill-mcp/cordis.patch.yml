@@ -1,6 +1,6 @@
-# dsh-skill-linker bundle layer.
+# dsh-skill-mcp bundle layer.
 # The dual-face package is inserted into the host loader; its dsh.client
 # declaration adds the browser module to the Web roster.
 - insert:
-    - id: dsh-skill-linker
-      name: 'dsh-skill-linker'
+    - id: dsh-skill-mcp
+      name: 'dsh-skill-mcp'

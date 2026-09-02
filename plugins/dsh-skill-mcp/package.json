@@ -1,20 +1,21 @@
 {
-  "name": "dsh-skill-linker",
-  "version": "0.1.0",
-  "description": "Link skill directories into the user skills root via junctions and manage their lifecycle (enable/disable/unlink/delete)",
+  "name": "dsh-skill-mcp",
+  "version": "0.2.0",
+  "description": "Management center: link skill directories into the user skills root (enable/disable/unlink/delete) and auto-load each project's own MCP servers via the loader",
   "license": "BSD-3-Clause",
-  "homepage": "https://github.com/LvanLa/deepseek-harness-ex/tree/master/plugins/dsh-skill-linker",
+  "homepage": "https://github.com/LvanLa/deepseek-harness-ex/tree/master/plugins/dsh-skill-mcp",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/LvanLa/deepseek-harness-ex.git",
-    "directory": "plugins/dsh-skill-linker"
+    "directory": "plugins/dsh-skill-mcp"
   },
   "keywords": [
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
     "skills",
-    "junction"
+    "junction",
+    "mcp"
   ],
   "type": "module",
   "main": "lib/index.js",
@@ -28,6 +29,8 @@
     "lib/client.js",
     "cordis.patch.yml",
     "scripts/link-skills.ps1",
+    "scripts/link-skills.sh",
+    "scripts/link-skills.mjs",
     "README.md"
   ],
   "dsh": {

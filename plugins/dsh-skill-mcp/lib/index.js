@@ -1,31 +1,35 @@
 /**
- * dsh-skill-linker host half.
+ * dsh-skill-mcp host half (v0.2.0).
  *
- * Skill management surface for the sidebar panel, modeled after
- * dsh-skill-manage's guard rules, plus this plugin's own signature feature:
- * junction-linking every skill under a source directory into the user
- * skills root (the in-process version of scripts/link-skills.ps1).
+ * 技能与MCP引擎，两部分共用同一条 connection RPC 通道（官方推荐的
+ * Client→Host 私有通道接缝，authority: 'loopback'，取代 v0.1 的
+ * /api/cc-skills/* HTTP 路由）：
  *
- * HTTP surface (the same pattern dsh-tokenledger uses for its panel):
- *   GET  /api/cc-skills/list     user-scope skills with link/status flags
- *   POST /api/cc-skills/link     { sourceDirectory } — junction each skill
- *                                subdirectory into ~/.dsh/skills; an existing
- *                                junction is replaced, a real dir/file aborts
- *   POST /api/cc-skills/unlink   { name } — remove one junction (links only)
- *   POST /api/cc-skills/delete   { name } — delete a skill behind guards:
- *                                `created_by: agent` marker, `pinned: true`,
- *                                no symlinked/junctioned skill dirs, path
- *                                confined to the skills root
- *   POST /api/cc-skills/disable  { name } — set `disable-model-invocation: true`
- *                                plus `user-invocable: false` (hides the skill
- *                                from both the model catalog and the chat picker)
- *   POST /api/cc-skills/enable   { name } — remove both flags
+ * 技能管理（v0.1 逻辑原样保留）：
+ *   skills/list      用户级技能 + 链接/置顶/停用/agent 标记
+ *   skills/link      { sourceDirectory } — 目录联接进 ~/.dsh/skills
+ *   skills/unlink    { name } — 只移除联接点
+ *   skills/delete    { name } — agent 创建 + 非置顶 + 路径围栏内才可删
+ *   skills/disable   { name } — frontmatter 双标记停用
+ *   skills/enable    { name } — 移除双标记
  *
- * Exact registrations sit outside the RPC trust boundary, so every handler
- * screens the caller on the loopback peer address before touching disk.
+ * 按项目 MCP 自动加载（v0.2 新增）：
+ *   mcp/sync         { cwd, force? } — client 推送当前会话工作区；
+ *                    host 读取用户级 ~/.dsh/mcp.json + 项目级
+ *                    <cwd>/.dsh/mcp.json（回退 <cwd>/.mcp.json Claude 格式），
+ *                    通过 ctx.loader 热加载/热卸载 @deepseek-ai/dsh-mcp-client
+ *                    条目（id 前缀 pmcp-，绝不触碰其他来源的条目）
+ *   mcp/status       条目 + fiber 阶段 + 工具计数 + 配置文件存在性
+ *   mcp/setEnabled   { name, enabled } — 热启停并持久化到
+ *                    ~/.dsh/project-mcp-state.json
+ *   mcp/reload       强制重读配置并 reconcile
+ *
+ * codegraph 场景：command "codegraph"、args ["serve","--mcp"]、cwd=项目根
+ * （靠项目根下的 .codegraph/ 定位索引）。
  */
 
 import { execFile } from 'node:child_process'
+import { watch as fsWatch } from 'node:fs'
 import { lstat, mkdir, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
 import { homedir } from 'node:os'
@@ -64,19 +68,28 @@ async function writeTextResilient(target, content) {
     return
   } catch (e) {
     if (e.code !== 'EPERM' && e.code !== 'EACCES' && e.code !== 'EBUSY') throw e
+    // The powershell escape hatch only exists on Windows. On POSIX the
+    // watcher lock is not observed in practice, so surface the denial.
+    if (process.platform !== 'win32') {
+      throw new Error(`write denied under the skills root (watcher lock); retry in a moment — ${e2str(e)}`)
+    }
+    try {
+      await powershellWrite(target, content)
+    } catch (e2) {
+      throw new Error(`write denied under the skills root (watcher lock); retry in a moment — ${e2str(e2)}`)
+    }
   }
-  try {
-    await powershellWrite(target, content)
-  } catch (e) {
-    throw new Error(`write denied under the skills root (watcher lock); retry in a moment — ${String(e?.message || e).slice(0, 160)}`)
-  }
+}
+
+/** Normalize an error to a short single-line string for error messages. */
+function e2str(e) {
+  return String(e?.message || e).slice(0, 160)
 }
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const BASE_PATH = '/api/cc-skills'
 const MAX_NAME_LENGTH = 64
 const MAX_DESCRIPTION_LENGTH = 1024
 const VALID_NAME_RE = /^[a-z0-9][a-z0-9._-]*$/
@@ -86,13 +99,21 @@ const DISABLE_KEY = 'disable-model-invocation'
 const USER_INVOCABLE_KEY = 'user-invocable'
 const PIN_KEY = 'pinned'
 
+// RPC 通道与按项目 MCP 的命名空间。
+const RPC_CHANNEL = '/skill-mcp'
+const MCP_ENTRY_PREFIX = 'pmcp-'
+const MCP_CLIENT_NAME = '@deepseek-ai/dsh-mcp-client'
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
+function dshHome() {
+  return process.env.DSH_HOME || path.join(homedir(), '.dsh')
+}
+
 function skillsRoot() {
-  const home = process.env.DSH_HOME || path.join(homedir(), '.dsh')
-  return path.join(home, 'skills')
+  return path.join(dshHome(), 'skills')
 }
 
 function fail(error) {
@@ -101,6 +122,15 @@ function fail(error) {
 
 function ok(message, extra = {}) {
   return { ok: true, message, ...extra }
+}
+
+/** connection RPC 的信封（镜像 dsh-skill-mcp-center 的 RpcResult 形状）。 */
+function rpcOk(value) {
+  return { ok: true, value }
+}
+
+function rpcFail(message) {
+  return { ok: false, error: { code: 'internal', message: String(message).slice(0, 300), details: {} } }
 }
 
 /**
@@ -206,7 +236,7 @@ async function atomicWrite(target, content) {
 }
 
 // ---------------------------------------------------------------------------
-// List
+// Skills: list
 // ---------------------------------------------------------------------------
 
 async function listSkills() {
@@ -255,14 +285,16 @@ async function listSkills() {
 }
 
 // ---------------------------------------------------------------------------
-// Link / unlink (the plugin's own feature)
+// Skills: link / unlink (the plugin's own feature)
 // ---------------------------------------------------------------------------
 
 /**
- * Create a junction. Defender and the skills watcher can transiently lock
- * the skills root while it hot-loads the previously linked skill, so each
- * attempt first clears a possible half-created reparse point, then tries
- * symlink 'junction' and `mklink /J` (no privilege needed either).
+ * Create a junction (Windows) or plain symlink (macOS/Linux — Node ignores
+ * the 'junction' type there). Defender and the skills watcher can transiently
+ * lock the skills root while it hot-loads the previously linked skill, so
+ * each attempt first clears a possible half-created reparse point, then
+ * tries symlink 'junction' and — Windows only — `mklink /J` (no privilege
+ * needed either).
  */
 async function createJunction(link, target) {
   let lastError
@@ -276,6 +308,7 @@ async function createJunction(link, target) {
       lastError = e
       if (e.code === 'EEXIST') throw e
     }
+    if (process.platform !== 'win32') continue
     try {
       await execFileP('cmd.exe', ['/d', '/c', 'mklink', '/J', link, target])
       return
@@ -342,7 +375,7 @@ async function unlinkSkill(name) {
 }
 
 // ---------------------------------------------------------------------------
-// Delete guards (from dsh-skill-manage)
+// Skills: delete guards (from dsh-skill-manage)
 // ---------------------------------------------------------------------------
 
 /**
@@ -396,7 +429,7 @@ async function deleteSkill(name) {
 }
 
 // ---------------------------------------------------------------------------
-// Frontmatter flags (disable / enable, from dsh-skill-manage)
+// Skills: frontmatter flags (disable / enable, from dsh-skill-manage)
 // ---------------------------------------------------------------------------
 
 /**
@@ -454,78 +487,348 @@ async function setSkillEnabled(name, enabled) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP surface
+// Project MCP: config reading & normalization
 // ---------------------------------------------------------------------------
 
-/** Loopback screen: the peer socket address cannot be forged, the Host header can. */
-function isLoopback(address) {
-  if (typeof address !== 'string' || address === '') return false
-  const bare = address.startsWith('::ffff:') ? address.slice(7) : address
-  if (bare === '::1' || bare === 'localhost') return true
-  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare)
+/** mcp-client 的 serverName 约束：[A-Za-z0-9_-]{1,32}，全局唯一。 */
+function sanitizeServerName(raw) {
+  const name = String(raw ?? '').trim().replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32)
+  return /^[A-Za-z0-9_-]{1,32}$/.test(name) ? name : ''
 }
 
-function screenRequest(req, method) {
-  if (req?.method !== method) return { status: 405, body: fail('method-not-allowed') }
-  const peerOk = isLoopback(req.socket?.remoteAddress)
-  const hostOk = isLoopback((req.headers?.host || '').replace(/:\d+$/, ''))
-  if (peerOk && hostOk) return undefined
-  return { status: 403, body: fail('forbidden') }
+function plainStringMap(raw) {
+  const out = {}
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out
+  for (const [k, v] of Object.entries(raw)) {
+    if (v === null || typeof v !== 'object' || Array.isArray(v)) continue
+    out[k] = {}
+    for (const [k2, v2] of Object.entries(v)) {
+      if (typeof v2 === 'string' || typeof v2 === 'number' || typeof v2 === 'boolean') out[k][k2] = v2
+    }
+  }
+  return out
 }
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let data = ''
-    req.on('data', (c) => { data += c })
-    req.on('end', () => {
-      try { resolve(data ? JSON.parse(data) : {}) } catch (e) { reject(e) }
-    })
-    req.on('error', reject)
-  })
+function numOrDefault(raw, dflt) {
+  return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : dflt
 }
 
-const ACTIONS = {
-  link: { method: 'POST', run: (args) => linkAllSkills(String(args.sourceDirectory || '')) },
-  unlink: { method: 'POST', run: (args) => unlinkSkill(String(args.name || '')) },
-  delete: { method: 'POST', run: (args) => deleteSkill(String(args.name || '')) },
-  disable: { method: 'POST', run: (args) => setSkillEnabled(String(args.name || ''), false) },
-  enable: { method: 'POST', run: (args) => setSkillEnabled(String(args.name || ''), true) },
+/**
+ * 把一条原始配置（dsh 原生或 Claude 格式）归一化成完整的 mcp-client config。
+ * stdio 的 cwd 相对路径按 projectRoot resolve，缺省即项目根 —— codegraph
+ * 正是靠 cwd 下的 .codegraph/ 定位索引。
+ */
+function normalizeMcpEntry(rawName, raw, projectRoot) {
+  const serverName = sanitizeServerName(rawName)
+  if (serverName === '') return null
+  const type = String(raw.type ?? '').toLowerCase()
+  const url = typeof raw.url === 'string' && raw.url !== '' ? raw.url : null
+  if (type === 'http' || type === 'sse' || type === 'streamable-http' || (!raw.command && url)) {
+    return {
+      transport: 'streamable-http',
+      serverName,
+      url,
+      headers: plainStringMap(raw.headers)[Object.keys(plainStringMap(raw.headers))[0] ?? ''] ?? {},
+      toolCallTimeoutMs: numOrDefault(raw.toolCallTimeoutMs, 60_000),
+      failOnStartupError: false,
+    }
+  }
+  const command = typeof raw.command === 'string' ? raw.command : ''
+  if (command === '') return null
+  const args = Array.isArray(raw.args) ? raw.args.map(String) : []
+  const envEntries = plainStringMap({ env: raw.env }).env ?? {}
+  const cwd = typeof raw.cwd === 'string' && raw.cwd !== ''
+    ? path.resolve(projectRoot, raw.cwd)
+    : projectRoot
+  const config = {
+    transport: 'stdio',
+    serverName,
+    command,
+    args,
+    env: envEntries,
+    cwd,
+    toolCallTimeoutMs: numOrDefault(raw.toolCallTimeoutMs, 60_000),
+    failOnStartupError: false,
+  }
+  if (raw.reconnect !== null && typeof raw.reconnect === 'object' && !Array.isArray(raw.reconnect)) {
+    config.reconnect = raw.reconnect
+  }
+  return config
 }
+
+/**
+ * 读一个配置文件并展开为 Map<serverName, config>。
+ * 识别两种格式：Claude（{ mcpServers: {…} }）与 dsh 原生（{ servers: {…} }
+ * 或顶层直接是 name→config 映射）。解析失败返回 { error }。
+ */
+async function readMcpConfigFile(filePath, projectRoot) {
+  let text
+  try {
+    text = await readFile(filePath, 'utf8')
+  } catch (e) {
+    if (e.code === 'ENOENT') return { servers: {} }
+    return { error: `${filePath}: ${e2str(e)}` }
+  }
+  let doc
+  try {
+    doc = JSON.parse(text.replace(/^\uFEFF/, ''))
+  } catch (e) {
+    return { error: `${filePath}: invalid JSON — ${e2str(e)}` }
+  }
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+    return { error: `${filePath}: top level must be a JSON object.` }
+  }
+  const rawMap = doc.mcpServers ?? doc.servers ?? doc
+  if (rawMap === null || typeof rawMap !== 'object' || Array.isArray(rawMap)) {
+    return { error: `${filePath}: no mcpServers/servers map found.` }
+  }
+  const servers = {}
+  for (const [name, raw] of Object.entries(rawMap)) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const config = normalizeMcpEntry(name, raw, projectRoot)
+    if (config !== null) servers[config.serverName] = config
+  }
+  return { servers }
+}
+
+async function pathExists(p) {
+  try { await lstat(p); return true } catch { return false }
+}
+
+/** 启停状态文件：{ disabled: [name, …] }。损坏时按空处理。 */
+function mcpStatePath() {
+  return path.join(dshHome(), 'project-mcp-state.json')
+}
+
+async function loadMcpDisabled() {
+  try {
+    const doc = JSON.parse(await readFile(mcpStatePath(), 'utf8'))
+    if (Array.isArray(doc?.disabled)) return doc.disabled.map(String)
+  } catch { /* absent or corrupt → empty */ }
+  return []
+}
+
+async function saveMcpDisabled(disabled) {
+  await mkdir(dshHome(), { recursive: true })
+  await atomicWrite(mcpStatePath(), JSON.stringify({ disabled }, null, 2) + '\n')
+}
+
+// ---------------------------------------------------------------------------
+// Project MCP: reconcile engine (ctx-bound, defined in apply)
+// ---------------------------------------------------------------------------
+
+export const name = 'dsh-skill-mcp'
+export const inject = ['connection', 'loader', 'tools']
 
 export function apply(ctx) {
-  // WAITED FOR, not sampled: `ctx.get("webServer")` at mount time answers
-  // undefined when the server mounts later, and the routes would silently
-  // 404 forever (the mistake tokenledger documents in its own http.js).
-  ctx.inject(["webServer"], (scoped) => {
-    const webServer = scoped.webServer
-    const route = (name) => {
-      const pathSpec = name === 'list' ? `${BASE_PATH}/list` : `${BASE_PATH}/${name}`
-      const method = name === 'list' ? 'GET' : 'POST'
-      ctx.effect(
-        () =>
-          webServer.register({
-            kind: 'exact',
-            path: pathSpec,
-            handler: async (req, res) => {
-              const send = (status, body) => {
-                res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-cache' })
-                res.end(JSON.stringify(body))
-              }
-              const refused = screenRequest(req, method)
-              if (refused !== undefined) return send(refused.status, refused.body)
-              try {
-                send(200, name === 'list' ? await listSkills() : await ACTIONS[name].run(await readBody(req)))
-              } catch (e) {
-                send(500, fail(e?.message || String(e)))
-              }
-            },
-          }),
-        `dsh-skill-linker: ${name} route`
-      )
-    }
+  // ---- MCP engine state ----
+  let lastCwd = null
+  let desired = new Map() // serverName -> { config, source, disabled }
+  let fileStates = { user: null, projectDsh: null, projectClaude: null }
+  const watchers = new Map() // watched dir -> { watcher, timer, key }
 
-    route('list')
-    for (const name of Object.keys(ACTIONS)) route(name)
-    console.log('[dsh-skill-linker] host ready: /api/cc-skills/* routes registered')
+  const userMcpPath = () => path.join(dshHome(), 'mcp.json')
+  const projectDshPath = (cwd) => path.join(cwd, '.dsh', 'mcp.json')
+  const projectClaudePath = (cwd) => path.join(cwd, '.mcp.json')
+
+  /** 读三层配置并合并：用户级 → 项目 .mcp.json → 项目 .dsh/mcp.json（后者覆盖同名）。 */
+  async function readDesired(cwd) {
+    const disabledList = new Set(await loadMcpDisabled())
+    const merged = new Map()
+    const layers = [
+      ['user', userMcpPath()],
+      ['project-mcp-json', projectClaudePath(cwd)],
+      ['project-dsh-json', projectDshPath(cwd)],
+    ]
+    const files = {}
+    for (const [source, filePath] of layers) {
+      files[source] = { path: filePath, exists: await pathExists(filePath) }
+      const parsed = await readMcpConfigFile(filePath, cwd)
+      if (parsed.error) return { error: parsed.error, files }
+      for (const [serverName, config] of Object.entries(parsed.servers)) {
+        merged.set(serverName, { config, source, disabled: disabledList.has(serverName) })
+      }
+    }
+    return { merged, files }
+  }
+
+  /** 与 ctx.loader 对账：只增删改 id 前缀 pmcp- 的条目。 */
+  async function reconcile() {
+    const entries = ctx.loader.entries().filter((e) => String(e.id).startsWith(MCP_ENTRY_PREFIX))
+    const byId = new Map(entries.map((e) => [e.id, e]))
+    for (const [serverName, item] of desired) {
+      const id = MCP_ENTRY_PREFIX + serverName
+      const existing = byId.get(id)
+      if (existing === undefined) {
+        await ctx.loader.create({ id, name: MCP_CLIENT_NAME, config: item.config })
+        if (item.disabled) await ctx.loader.update(id, { disabled: true })
+        continue
+      }
+      const sameConfig = JSON.stringify(existing.options?.config ?? null) === JSON.stringify(item.config)
+      if (!sameConfig) await ctx.loader.update(id, { config: item.config })
+      const wantDisabled = item.disabled === true
+      if (Boolean(existing.disabled) !== wantDisabled) {
+        await ctx.loader.update(id, { disabled: wantDisabled ? true : null })
+      }
+    }
+    for (const [id] of byId) {
+      if (!desired.has(id.slice(MCP_ENTRY_PREFIX.length))) await ctx.loader.remove(id)
+    }
+  }
+
+  /** 关掉不再属于当前配置集的监听；为存在的配置文件所在目录开新监听。 */
+  function rewatchFiles() {
+    for (const [dir, entry] of watchers) {
+      if (fileStatesBelong(dir)) continue
+      entry.close()
+      watchers.delete(dir)
+    }
+    for (const source of ['user', 'project-mcp-json', 'project-dsh-json']) {
+      const info = fileStates[source]
+      if (!info?.exists) continue
+      const dir = path.dirname(info.path)
+      if (watchers.has(dir)) continue
+      let timer = null
+      let watcher = null
+      try {
+        watcher = fsWatch(dir, (event, filename) => {
+          if (filename !== null && path.basename(info.path) !== filename) return
+          if (timer !== null) clearTimeout(timer)
+          timer = setTimeout(() => {
+            timer = null
+            void sync(lastCwd, true).catch((e) => console.warn('[dsh-skill-mcp] mcp file-watch sync failed:', e2str(e)))
+          }, 500)
+        })
+      } catch { /* dir may vanish; sync() re-establishes */ }
+      watchers.set(dir, {
+        close: () => {
+          try { watcher?.close() } catch { /* already closed */ }
+          if (timer !== null) { clearTimeout(timer); timer = null }
+        },
+      })
+    }
+  }
+
+  function fileStatesBelong(dir) {
+    for (const source of ['user', 'project-mcp-json', 'project-dsh-json']) {
+      const info = fileStates[source]
+      if (info?.exists && path.dirname(info.path) === dir) return true
+    }
+    return false
+  }
+
+  /** sync 主体：cwd 变化或 force 时重读配置并 reconcile。 */
+  async function sync(cwd, force = false) {
+    if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) {
+      throw new Error('mcp/sync: cwd must be an absolute path')
+    }
+    let st
+    try { st = await lstat(cwd) } catch { throw new Error(`mcp/sync: cwd not found: ${cwd}`) }
+    if (!st.isDirectory()) throw new Error(`mcp/sync: not a directory: ${cwd}`)
+    if (!force && cwd === lastCwd) return { changed: false, cwd: lastCwd, names: [...desired.keys()] }
+    const parsed = await readDesired(cwd)
+    if (parsed.error) throw new Error(parsed.error)
+    lastCwd = cwd
+    desired = parsed.merged
+    fileStates = parsed.files
+    await reconcile()
+    rewatchFiles()
+    return { changed: true, cwd, names: [...desired.keys()], sources: Object.fromEntries([...desired].map(([n, it]) => [n, it.source])) }
+  }
+
+  /** 运行状态：fiber 阶段 + 工具计数（seam 优先，ctx.tools 派生回退）。 */
+  async function mcpStatus() {
+    const servers = []
+    const entries = ctx.loader.entries().filter((e) => String(e.id).startsWith(MCP_ENTRY_PREFIX))
+    const byId = new Map(entries.map((e) => [e.id, e]))
+    const seam = ctx.get?.('mcpStatus')
+    const toolNames = (seam === undefined && typeof ctx.tools?.schemas === 'function')
+      ? ctx.tools.schemas().map((s) => s.name)
+      : []
+    for (const [serverName, item] of desired) {
+      const entry = byId.get(MCP_ENTRY_PREFIX + serverName)
+      const fiberState = entry?.fiber?.state
+      const fiberPhase = fiberState === undefined || fiberState === null ? null
+        : ({ 0: 'pending', 1: 'loading', 2: 'active', 3: 'failed', 4: null, 5: 'unloading' })[fiberState] ?? null
+      let toolCount = 0
+      let connected = false
+      if (seam !== undefined && typeof seam?.list === 'function') {
+        const st = seam.list().find((s) => s.serverName === serverName)
+        toolCount = st?.toolCount ?? 0
+        connected = st?.phase === 'connected'
+      } else {
+        const prefix = `mcp__${serverName}__`
+        toolCount = toolNames.filter((n) => n.startsWith(prefix)).length
+        connected = !item.disabled && fiberPhase === 'active' && toolCount > 0
+      }
+      servers.push({
+        name: serverName,
+        source: item.source,
+        disabled: item.disabled,
+        transport: item.config.transport,
+        command: item.config.command ?? null,
+        args: item.config.args ?? null,
+        cwd: item.config.cwd ?? null,
+        url: item.config.url ?? null,
+        fiberPhase,
+        toolCount,
+        connected,
+      })
+    }
+    servers.sort((a, b) => a.name.localeCompare(b.name))
+    const files = {}
+    for (const [source, info] of Object.entries(fileStates)) {
+      files[source] = { path: info?.path ?? null, exists: info?.exists === true }
+    }
+    return { cwd: lastCwd, servers, files }
+  }
+
+  /** 热启停并持久化（名字只认当前 desired 集合里的 server）。 */
+  async function setMcpEnabled(serverName, enabled) {
+    const item = desired.get(String(serverName ?? ''))
+    if (item === undefined) return fail(`Unknown project MCP server '${serverName}'.`)
+    item.disabled = !enabled
+    const disabledList = [...desired.entries()].filter(([, it]) => it.disabled).map(([n]) => n)
+    await saveMcpDisabled(disabledList)
+    await reconcile()
+    return ok(enabled ? `MCP server '${serverName}' enabled.` : `MCP server '${serverName}' disabled.`)
+  }
+
+  // ---- connection RPC surface（官方推荐的 Client→Host 私有通道） ----
+
+  const endpoints = {
+    'skills/list': { run: async () => listSkills() },
+    'skills/link': { run: async (p) => linkAllSkills(String(p.sourceDirectory || '')) },
+    'skills/unlink': { run: async (p) => unlinkSkill(String(p.name || '')) },
+    'skills/delete': { run: async (p) => deleteSkill(String(p.name || '')) },
+    'skills/disable': { run: async (p) => setSkillEnabled(String(p.name || ''), false) },
+    'skills/enable': { run: async (p) => setSkillEnabled(String(p.name || ''), true) },
+    'mcp/sync': { run: async (p) => sync(p.cwd, p.force === true) },
+    'mcp/status': { run: async () => mcpStatus() },
+    'mcp/setEnabled': { run: async (p) => setMcpEnabled(p.name, p.enabled === true) },
+    'mcp/reload': {
+      run: async () => {
+        if (lastCwd === null) return ok('No project synced yet — nothing to reload.')
+        return sync(lastCwd, true)
+      },
+    },
+  }
+
+  ctx.connection.rpc.handle(RPC_CHANNEL, async (endpoint, payload) => {
+    try {
+      const action = endpoints[endpoint]
+      if (action === undefined) return rpcFail(`unknown endpoint "${endpoint}"`)
+      return rpcOk(await action.run(payload ?? {}))
+    } catch (e) {
+      return rpcFail(e?.message || String(e))
+    }
+  }, { authority: 'loopback' })
+
+  // 文件监听随插件卸载关闭。
+  ctx.effect(() => () => {
+    for (const [, entry] of watchers) entry.close()
+    watchers.clear()
   })
+
+  console.log(`[dsh-skill-mcp] host ready: connection RPC channel '${RPC_CHANNEL}' (skills + project MCP)`)
 }

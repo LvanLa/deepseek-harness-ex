@@ -1,9 +1,12 @@
 param(
   [Parameter(Mandatory=$true)]
   [string]$SourceDirectory,
-  [string]$TargetDirectory = 'C:\Users\Administrator\.dsh\skills'
+  [string]$TargetDirectory = ''
 )
 $ErrorActionPreference = 'Stop'
+if (-not $TargetDirectory) {
+  $TargetDirectory = if ($env:DSH_HOME) { Join-Path $env:DSH_HOME 'skills' } else { Join-Path $env:USERPROFILE '.dsh\skills' }
+}
 $source = (Resolve-Path -LiteralPath $SourceDirectory).Path
 New-Item -ItemType Directory -Force -Path $TargetDirectory | Out-Null
 Get-ChildItem -LiteralPath $source -Directory -Force | ForEach-Object {
