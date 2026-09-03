@@ -10,8 +10,7 @@
  * - MCP 管理（v0.3）：添加/编辑（表单 + JSON 切换）/删除（二次确认），
  *   从其他 agent（Claude Code / Codex / Cursor / Gemini CLI）扫描导入，
  *   写入作用域显式选择（全局 / 当前项目）。
- * - 挂载点：设置页 settings.section + 侧边栏 footer 快捷入口（全屏浮层），
- *   两处均渲染同一 CenterPanel。
+ * - 挂载点：设置页 settings.section 槽位，渲染 CenterPanel。
  */
 window.__ModuleLoader__.load({
   id: "dsh-skill-mcp",
@@ -43,14 +42,6 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------------------------
 
     const css = `
-      .dsh-ccs-overlay { position: fixed; inset: 0; z-index: 1000; display: flex;
-        align-items: center; justify-content: center;
-        background: var(--dsw-alias-scrim, rgba(0,0,0,0.45)); }
-      .dsh-ccs-overlay-panel { width: 640px; max-width: 92vw; height: min(640px, 86vh);
-        background: var(--dsw-alias-bg-primary, #fff); color: var(--dsw-alias-text-primary, #222);
-        border-radius: 12px; padding: 20px 22px;
-        box-shadow: 0 8px 32px rgba(0,0,0,0.2);
-        display: flex; flex-direction: column; }
       .dsh-ccs-page { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
       .dsh-ccs-title { margin: 0 0 6px; font-size: 16px; font-weight: 600; flex-shrink: 0; }
       .dsh-ccs-tabs { display: flex; gap: 2px; margin: 8px 0 14px; flex-shrink: 0;
@@ -103,9 +94,6 @@ window.__ModuleLoader__.load({
       .dsh-ccs-body-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; max-height: 60vh; }
       .dsh-ccs-body-scroll::-webkit-scrollbar { width: 8px; }
       .dsh-ccs-body-scroll::-webkit-scrollbar-thumb { background: var(--dsw-alias-scrollbar-bg-l2, rgba(127,127,127,0.35)); border-radius: 4px; }
-      /* 浮层高度固定，列表区撑满剩余空间，去掉兜底上限 */
-      .dsh-ccs-overlay-panel .dsh-ccs-list-scroll,
-      .dsh-ccs-overlay-panel .dsh-ccs-body-scroll { max-height: none; }
       /* 设置页上下文：区块撑满设置内容区剩余高度，消除底部大片留白 */
       .dsh-ccs-page-fill { flex: 1 0 auto; min-height: calc(100vh - 180px); }
       .dsh-ccs-page-fill .dsh-ccs-list-scroll,
@@ -139,8 +127,7 @@ window.__ModuleLoader__.load({
         border: 1px solid var(--dsw-alias-border-primary, rgba(127,127,127,0.35));
         background: var(--dsw-alias-bg-primary, transparent); color: var(--dsw-alias-text-primary, #222); }
       .dsh-ccs-input-row { display: flex; gap: 8px; align-items: center; margin: 12px 0; }
-      /* 弹框：添加/编辑 MCP（遮罩用 bg-mask-1，表面用实底 bg-base，避免透出变暗）。
-         z-index 取 1100，高于全屏浮层 .dsh-ccs-overlay 的 1000。 */
+      /* 弹框：添加/编辑 MCP（遮罩用 bg-mask-1，表面用实底 bg-base，避免透出变暗） */
       .dsh-ccs-modal-mask { position: fixed; inset: 0; z-index: 1100; display: flex;
         align-items: center; justify-content: center; padding: 24px;
         background: var(--dsw-alias-bg-mask-1, rgba(0,0,0,0.45)); }
@@ -274,22 +261,6 @@ window.__ModuleLoader__.load({
       .dsh-ccs-check-sub { flex: 1; min-width: 0; color: var(--dsw-alias-label-tertiary, #8a8a8a);
         font-family: var(--ds-font-family-code, ui-monospace, Consolas, monospace);
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      /* 侧栏 footer 入口：整行按钮（图标 + 文字），对齐原生 Settings 行。 */
-      div:has(> [data-slot='sidebar.footer.action']) { flex-wrap: wrap; }
-      .dsh-ccs-launcher { flex: 0 0 100%; min-width: 0; display: flex; align-items: center;
-        height: 40px; margin: 0; position: relative; }
-      .dsh-ccs-launcher-btn { width: 100%; min-width: 0; height: 40px; cursor: pointer;
-        color: var(--dsw-alias-label-primary, #222); background: none; border: none; border-radius: 0;
-        display: inline-flex; align-items: center; gap: 6px; padding: 0 8px 0 6px;
-        font-family: inherit; font-size: 14px; overflow: hidden; }
-      .dsh-ccs-launcher-btn:hover { background: var(--dsw-alias-interactive-bg-hover-solid, rgba(127,127,127,0.12)); }
-      .dsh-ccs-launcher-icon { flex: none; display: inline-flex; align-items: center; }
-      .dsh-ccs-launcher-label { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-      /* 侧栏收起成 56px rail：入口缩成 36px 圆形，文字隐藏。 */
-      .dsh-ccs-launcher.dsh-ccs-rail { flex: none; width: 36px; height: 36px; margin: 0; }
-      .dsh-ccs-launcher.dsh-ccs-rail .dsh-ccs-launcher-btn { border-radius: 50%; justify-content: center;
-        gap: 0; width: 36px; height: 36px; padding: 0; }
-      .dsh-ccs-launcher.dsh-ccs-rail .dsh-ccs-launcher-label { display: none; }
     `;
 
     function ensureStyles() {
@@ -1222,44 +1193,6 @@ window.__ModuleLoader__.load({
       });
     }
 
-    /**
-     * 侧边栏 footer 快捷入口：整行「⚡ 技能与MCP」按钮，点击打开全屏浮层。
-     * 插槽只传 `wide`（侧栏是否展开）；收起时缩成 36px 圆形、隐藏文字。
-     * 注意：宿主不渲染描述里的 label，文字必须由组件自绘。
-     */
-    function SidebarLauncher({ wide }) {
-      const [open, setOpen] = React.useState(false);
-      return jsx(React.Fragment, {
-        children: [
-          jsx('div', {
-            key: 'seat', className: `dsh-ccs-launcher${wide === false ? ' dsh-ccs-rail' : ''}`,
-            children: jsx('button', {
-              key: 'btn', type: 'button', className: 'dsh-ccs-launcher-btn',
-              title: '技能与MCP', 'aria-label': '技能与MCP', onClick: () => setOpen(true),
-              children: [
-                jsx('span', { key: 'icon', className: 'dsh-ccs-launcher-icon', children: '⚡' }),
-                jsx('span', { key: 'label', className: 'dsh-ccs-launcher-label', children: '技能与MCP' }),
-              ],
-            }),
-          }),
-          open
-            ? jsx('div', {
-                key: 'overlay', className: 'dsh-ccs-overlay',
-                onClick: (e) => { if (e.target === e.currentTarget) setOpen(false); },
-                children: jsx('div', {
-                  className: 'dsh-ccs-overlay-panel',
-                  children: jsx(CenterPanel, {
-                    pickDirectory: hostCtx?.workspaces
-                      ? () => hostCtx.workspaces.pickDirectory()
-                      : undefined,
-                  }),
-                }),
-              })
-            : null,
-        ],
-      });
-    }
-
     // ------------------------------------------------------------------
     // apply
     // ------------------------------------------------------------------
@@ -1283,14 +1216,6 @@ window.__ModuleLoader__.load({
         // 注意要包一层箭头函数：方法内部依赖 this，摘下来传会丢绑定。
         pickDirectory: ctx.workspaces ? () => ctx.workspaces.pickDirectory() : undefined,
       })));
-
-      // 侧边栏 footer ⚡ 快捷入口（sidebar.footer.action 槽位）
-      ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
-        name: 'sidebar.footer.action',
-        id: 'dsh-skill-mcp',
-        order: 30,
-        label: () => '技能与MCP',
-      }, SidebarLauncher));
     };
 
     return { apply, inject: INJECT };
