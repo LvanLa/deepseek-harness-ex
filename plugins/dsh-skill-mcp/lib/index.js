@@ -24,6 +24,15 @@
  *                    ~/.dsh/project-mcp-state.json
  *   mcp/reload       强制重读配置并 reconcile
  *
+ * MCP 管理（v0.3 新增）：
+ *   mcp/save         { name, scope, transport, … } — 添加/编辑（upsert）到
+ *                    全局 ~/.dsh/mcp.json 或项目 .dsh/mcp.json（Claude 格式）
+ *   mcp/get          { name } — 取原始条目（user → .mcp.json → .dsh/mcp.json 顺序）
+ *   mcp/remove       { name } — 从所在配置文件删除并立即 reconcile
+ *   mcp/import/scan  扫描其他 agent（Claude Code / Cursor / Codex / Gemini CLI）
+ *                    的本机 MCP 配置，返回 { servers, existing }
+ *   mcp/import/apply { items, scope } — 勾选导入；已存在的逐条跳过
+ *
  * codegraph 场景：command "codegraph"、args ["serve","--mcp"]、cwd=项目根
  * （靠项目根下的 .codegraph/ 定位索引）。
  */
@@ -509,6 +518,16 @@ function plainStringMap(raw) {
   return out
 }
 
+/** 扁平字符串记录（headers/env 的 Claude 格式：{ "X-Key": "value" }）。 */
+function flatStringRecord(raw) {
+  const out = {}
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out
+  for (const [k, v] of Object.entries(raw)) {
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') out[k] = String(v)
+  }
+  return out
+}
+
 function numOrDefault(raw, dflt) {
   return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : dflt
 }
@@ -524,11 +543,17 @@ function normalizeMcpEntry(rawName, raw, projectRoot) {
   const type = String(raw.type ?? '').toLowerCase()
   const url = typeof raw.url === 'string' && raw.url !== '' ? raw.url : null
   if (type === 'http' || type === 'sse' || type === 'streamable-http' || (!raw.command && url)) {
+    // headers 优先按扁平字符串记录读（Claude http 格式）；旧嵌套写法兜底。
+    const flatHeaders = flatStringRecord(raw.headers)
+    const nested = plainStringMap(raw.headers)
+    const headers = Object.keys(flatHeaders).length > 0
+      ? flatHeaders
+      : (nested[Object.keys(nested)[0] ?? ''] ?? {})
     return {
       transport: 'streamable-http',
       serverName,
       url,
-      headers: plainStringMap(raw.headers)[Object.keys(plainStringMap(raw.headers))[0] ?? ''] ?? {},
+      headers,
       toolCallTimeoutMs: numOrDefault(raw.toolCallTimeoutMs, 60_000),
       failOnStartupError: false,
     }
@@ -593,6 +618,242 @@ async function readMcpConfigFile(filePath, projectRoot) {
 
 async function pathExists(p) {
   try { await lstat(p); return true } catch { return false }
+}
+
+// ---------------------------------------------------------------------------
+// MCP CRUD & import: raw config documents
+// ---------------------------------------------------------------------------
+
+/** 配置文档里持有 server 映射的键（mcpServers 优先，兼容 dsh 原生 servers）。 */
+function serverMapOf(doc) {
+  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) return null
+  if (doc.mcpServers !== null && typeof doc.mcpServers === 'object' && !Array.isArray(doc.mcpServers)) return doc.mcpServers
+  if (doc.servers !== null && typeof doc.servers === 'object' && !Array.isArray(doc.servers)) return doc.servers
+  return null
+}
+
+/** 读原始 JSON 文档：缺失 → {doc:null}；损坏 → {error}。 */
+async function readMcpDoc(filePath) {
+  let text
+  try {
+    text = await readFile(filePath, 'utf8')
+  } catch (e) {
+    if (e.code === 'ENOENT') return { doc: null }
+    return { error: e2str(e) }
+  }
+  try {
+    const doc = JSON.parse(text.replace(/^\uFEFF/, ''))
+    if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) return { error: 'top level must be a JSON object' }
+    return { doc }
+  } catch (e) {
+    return { error: `invalid JSON — ${e2str(e)}` }
+  }
+}
+
+async function writeMcpDoc(filePath, doc) {
+  await mkdir(path.dirname(filePath), { recursive: true })
+  await atomicWrite(filePath, JSON.stringify(doc, null, 2) + '\n')
+}
+
+// ---------------------------------------------------------------------------
+// MCP import: foreign agent config readers (Claude Code / Codex / Cursor / Gemini)
+// ---------------------------------------------------------------------------
+
+/**
+ * 零依赖 TOML 子集解析器：足够覆盖 ~/.codex/config.toml 的
+ * [mcp_servers.<name>] 表（command/args/env/url，多行数组、内联表、注释）。
+ */
+function parseTomlSubset(text) {
+  const root = {}
+  let target = root
+  const unquote = (s) => {
+    const t = s.trim()
+    if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) return t.slice(1, -1)
+    return t
+  }
+  const parseValue = (raw) => {
+    const s = raw.trim()
+    if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) return s.slice(1, -1).replace(/\\(["\\nt])/g, (_, c) => ({ '"': '"', '\\': '\\', n: '\n', t: '\t' })[c])
+    if (s.startsWith("'") && s.endsWith("'") && s.length >= 2) return s.slice(1, -1)
+    if (s === 'true') return true
+    if (s === 'false') return false
+    if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s)
+    if (s.startsWith('[') || s.startsWith('{')) {
+      // 多行数组/内联表已由调用方配平括号后合并成单行。
+      if (s.startsWith('[')) {
+        const inner = s.slice(1, -1)
+        const items = []
+        for (const part of splitTopLevel(inner, ',')) {
+          const piece = part.trim()
+          if (piece !== '') items.push(parseValue(piece))
+        }
+        return items
+      }
+      const table = {}
+      for (const part of splitTopLevel(s.slice(1, -1), ',')) {
+        const m = part.match(/^([^=]+)=(.*)$/)
+        if (m) table[unquote(m[1])] = parseValue(m[2])
+      }
+      return table
+    }
+    return s
+  }
+  /** 按分隔符切分，忽略字符串字面量内与嵌套 [] {} 中的分隔符。 */
+  const splitTopLevel = (text, sep) => {
+    const parts = []
+    let depth = 0
+    let quote = null
+    let current = ''
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i]
+      if (quote !== null) {
+        if (ch === quote && text[i - 1] !== '\\') quote = null
+        current += ch
+        continue
+      }
+      if (ch === '"' || ch === "'") { quote = ch; current += ch; continue }
+      if (ch === '[' || ch === '{') depth++
+      if (ch === ']' || ch === '}') depth--
+      if (ch === sep && depth === 0) { parts.push(current); current = ''; continue }
+      current += ch
+    }
+    if (current.trim() !== '') parts.push(current)
+    return parts
+  }
+  const lines = String(text).split(/\r?\n/)
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim()
+    if (line === '' || line.startsWith('#')) continue
+    const section = line.match(/^\[\s*([^\]]+?)\s*\]$/)
+    if (section) {
+      target = root
+      for (const part of section[1].split('.')) {
+        const key = unquote(part)
+        if (target[key] === null || typeof target[key] !== 'object' || Array.isArray(target[key])) target[key] = {}
+        target = target[key]
+      }
+      continue
+    }
+    const kv = line.match(/^([^=]+?)\s*=\s*(.+)$/)
+    if (!kv) continue
+    let valueText = kv[2].trim()
+    // 多行数组 / 内联表：向后累积直到括号配平。
+    const opener = valueText[0]
+    if (opener === '[' || opener === '{') {
+      const closer = opener === '[' ? ']' : '}'
+      let depth = 0
+      let quote = null
+      for (const ch of valueText) {
+        if (quote !== null) { if (ch === quote) quote = null; continue }
+        if (ch === '"' || ch === "'") { quote = ch; continue }
+        if (ch === opener) depth++
+        if (ch === closer) depth--
+      }
+      let j = i
+      while (depth > 0 && j + 1 < lines.length) {
+        j++
+        const next = lines[j].trim()
+        valueText += ' ' + next
+        for (const ch of next) {
+          if (quote !== null) { if (ch === quote) quote = null; continue }
+          if (ch === '"' || ch === "'") { quote = ch; continue }
+          if (ch === opener) depth++
+          if (ch === closer) depth--
+        }
+      }
+      i = j
+    }
+    target[unquote(kv[1])] = parseValue(valueText)
+  }
+  return root
+}
+
+/** 一条外部 agent 条目 → 可导入的描述；SSE 等不支持的形状返回 null。 */
+function mapForeignEntry(agent, name, entry) {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return null
+  const type = typeof entry.type === 'string' ? entry.type.toLowerCase() : ''
+  if (type === 'sse') return null
+  const url = typeof entry.url === 'string' ? entry.url
+    : (typeof entry.httpUrl === 'string' ? entry.httpUrl : '')
+  const http = type === 'http' || type === 'streamable-http' || (!entry.command && url !== '')
+  if (http) {
+    if (!/^https?:\/\//.test(url)) return null
+    const headers = flatStringRecord(entry.headers)
+    return {
+      agent, name, transport: 'http', url,
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+    }
+  }
+  if (typeof entry.command !== 'string' || entry.command === '') return null
+  const args = Array.isArray(entry.args)
+    ? entry.args.filter((a) => typeof a === 'string' || typeof a === 'number').map(String)
+    : []
+  const env = flatStringRecord(entry.env)
+  return {
+    agent, name, transport: 'stdio', command: entry.command,
+    ...(args.length > 0 ? { args } : {}),
+    ...(Object.keys(env).length > 0 ? { env } : {}),
+  }
+}
+
+/** 逐个读 JSON 配置文件的 mcpServers 映射；缺失/损坏跳过。 */
+async function readForeignJsonMap(filePaths) {
+  const merged = {}
+  for (const file of filePaths) {
+    const read = await readMcpDoc(file)
+    if (read.error || read.doc === null) continue
+    const map = serverMapOf(read.doc)
+    if (map !== null) Object.assign(merged, map)
+  }
+  return merged
+}
+
+/**
+ * 扫描本机其他 agent 的 MCP 配置。纯读取已知路径；
+ * 缺失或损坏的文件静默跳过。返回 [{agent, name, transport, …}]。
+ */
+async function scanForeignMcp() {
+  const home = homedir()
+  const out = []
+  const seen = new Set()
+  const collect = (agent, rawMap) => {
+    for (const [name, entry] of Object.entries(rawMap)) {
+      const key = `${agent}/${name}`
+      if (seen.has(key)) continue
+      const mapped = mapForeignEntry(agent, name, entry)
+      if (mapped !== null) { seen.add(key); out.push(mapped) }
+    }
+  }
+  // Claude Code：settings.json 在前，.claude.json 覆盖同名。
+  collect('claude-code', await readForeignJsonMap([path.join(home, '.claude', 'settings.json'), path.join(home, '.claude.json')]))
+  // Cursor：~/.cursor/mcp.json（Claude 同形）。
+  collect('cursor', await readForeignJsonMap([path.join(home, '.cursor', 'mcp.json')]))
+  // Gemini CLI：~/.gemini/settings.json（httpUrl → http）。
+  collect('gemini', await readForeignJsonMap([path.join(home, '.gemini', 'settings.json')]))
+  // Codex：~/.codex/config.toml 的 [mcp_servers.*]。
+  try {
+    const text = await readFile(path.join(home, '.codex', 'config.toml'), 'utf8')
+    const root = parseTomlSubset(text)
+    const table = root.mcp_servers
+    collect('codex', table !== null && typeof table === 'object' && !Array.isArray(table) ? table : {})
+  } catch { /* missing or unreadable → skip */ }
+  return out
+}
+
+/** 可导入条目 → 写入 dsh 配置的 Claude 格式原始条目。 */
+function foreignToRawEntry(server) {
+  if (server.transport === 'http') {
+    return {
+      type: 'http',
+      url: server.url,
+      ...(server.headers && Object.keys(server.headers).length > 0 ? { headers: server.headers } : {}),
+    }
+  }
+  return {
+    command: server.command,
+    ...(Array.isArray(server.args) && server.args.length > 0 ? { args: server.args } : {}),
+    ...(server.env && Object.keys(server.env).length > 0 ? { env: server.env } : {}),
+  }
 }
 
 /** 启停状态文件：{ disabled: [name, …] }。损坏时按空处理。 */
@@ -794,6 +1055,146 @@ export function apply(ctx) {
     return ok(enabled ? `MCP server '${serverName}' enabled.` : `MCP server '${serverName}' disabled.`)
   }
 
+  // ---- MCP CRUD（添加/编辑/删除）与导入 ----
+
+  /**
+   * 写入作用域 → 目标文件路径。'user' 全局；'project-dsh' 当前项目 .dsh/mcp.json；
+   * 'project-mcp' 当前项目 .mcp.json（仅编辑该来源条目时用）。
+   * 项目作用域需要已同步的工作区。
+   */
+  function scopeFilePath(scope) {
+    if (scope === 'user') return userMcpPath()
+    if (scope === 'project-dsh') return lastCwd === null ? null : projectDshPath(lastCwd)
+    if (scope === 'project-mcp') return lastCwd === null ? null : projectClaudePath(lastCwd)
+    return null
+  }
+
+  /** 写入后立即重读配置并 reconcile（不依赖 0.5s 的文件监听）。 */
+  async function resync() {
+    if (lastCwd !== null) await sync(lastCwd, true)
+  }
+
+  /** 添加/编辑（upsert）一条 MCP 服务到指定作用域的配置文件。 */
+  async function saveMcpServer(payload) {
+    const scope = String(payload.scope || 'user')
+    const filePath = scopeFilePath(scope)
+    if (filePath === null) return fail(`Scope '${scope}' 需要已同步的工作区 —— 请先打开一个项目。`)
+    const name = sanitizeServerName(payload.name)
+    if (name === '') return fail("Invalid server name: use 1-32 chars of A-Z a-z 0-9 _ -")
+    const wantsHttp = payload.transport === 'http' || payload.transport === 'streamable-http'
+      || payload.transport === 'sse' || payload.transport === 'streamable_http'
+    let entry
+    if (wantsHttp) {
+      const url = typeof payload.url === 'string' ? payload.url.trim() : ''
+      if (!/^https?:\/\//.test(url)) return fail('HTTP 传输需要一个 http(s) URL。')
+      const headers = flatStringRecord(payload.headers)
+      entry = { type: 'http', url, ...(Object.keys(headers).length > 0 ? { headers } : {}) }
+    } else {
+      const command = typeof payload.command === 'string' ? payload.command.trim() : ''
+      if (command === '') return fail('stdio 传输需要 command。')
+      const args = Array.isArray(payload.args) ? payload.args.map(String) : []
+      const env = flatStringRecord(payload.env)
+      entry = {
+        command,
+        ...(args.length > 0 ? { args } : {}),
+        ...(Object.keys(env).length > 0 ? { env } : {}),
+        ...(typeof payload.cwd === 'string' && payload.cwd.trim() !== '' ? { cwd: payload.cwd.trim() } : {}),
+      }
+    }
+    const read = await readMcpDoc(filePath)
+    if (read.error) return fail(`${filePath}: ${read.error}`)
+    const doc = read.doc ?? {}
+    const map = serverMapOf(doc) ?? (doc.mcpServers = {})
+    const replaced = Object.prototype.hasOwnProperty.call(map, name)
+    map[name] = entry
+    await writeMcpDoc(filePath, doc)
+    await resync()
+    return ok(
+      replaced ? `MCP 服务 '${name}' 已更新（${filePath}）。` : `MCP 服务 '${name}' 已添加到 ${filePath}。`,
+      { name, scope, path: filePath, replaced },
+    )
+  }
+
+  /** 配置层查找顺序（get/remove 共用）。 */
+  function configLayers() {
+    return [
+      ['user', userMcpPath()],
+      ['project-mcp-json', lastCwd === null ? null : projectClaudePath(lastCwd)],
+      ['project-dsh-json', lastCwd === null ? null : projectDshPath(lastCwd)],
+    ]
+  }
+
+  /** 取一条 MCP 服务的原始配置（编辑表单 / JSON 编辑器填充用）。 */
+  async function getMcpServer(name) {
+    const key = String(name ?? '')
+    for (const [source, filePath] of configLayers()) {
+      if (filePath === null) continue
+      const read = await readMcpDoc(filePath)
+      if (read.error || read.doc === null) continue
+      const map = serverMapOf(read.doc)
+      if (map !== null && Object.prototype.hasOwnProperty.call(map, key)) {
+        return ok(`found in ${filePath}`, { name: key, source, path: filePath, raw: map[key] })
+      }
+    }
+    return fail(`MCP 服务 '${key}' 不在任何配置文件中。`)
+  }
+
+  /** 从所在配置文件删除一条 MCP 服务，写回并立即 reconcile。 */
+  async function removeMcpServer(name) {
+    const key = String(name ?? '')
+    for (const [source, filePath] of configLayers()) {
+      if (filePath === null) continue
+      const read = await readMcpDoc(filePath)
+      if (read.error || read.doc === null) continue
+      const map = serverMapOf(read.doc)
+      if (map === null || !Object.prototype.hasOwnProperty.call(map, key)) continue
+      delete map[key]
+      await writeMcpDoc(filePath, read.doc)
+      await resync()
+      return ok(`MCP 服务 '${key}' 已从 ${filePath} 删除。`, { name: key, source, path: filePath })
+    }
+    return fail(`MCP 服务 '${key}' 不在任何配置文件中。`)
+  }
+
+  /** 把选中的外部 agent 条目写入目标作用域；已存在的逐条跳过。 */
+  async function applyImport(payload) {
+    const scope = String(payload.scope || 'user')
+    const filePath = scopeFilePath(scope)
+    if (filePath === null) return fail(`Scope '${scope}' 需要已同步的工作区 —— 请先打开一个项目。`)
+    const wanted = new Set(
+      (Array.isArray(payload.items) ? payload.items : [])
+        .filter((it) => it !== null && typeof it === 'object')
+        .map((it) => `${String(it.agent)}/${String(it.name)}`),
+    )
+    if (wanted.size === 0) return fail('没有选择要导入的服务。')
+    const scanned = await scanForeignMcp()
+    const read = await readMcpDoc(filePath)
+    if (read.error) return fail(`${filePath}: ${read.error}`)
+    const doc = read.doc ?? {}
+    const map = serverMapOf(doc) ?? (doc.mcpServers = {})
+    const results = []
+    for (const server of scanned) {
+      if (!wanted.has(`${server.agent}/${server.name}`)) continue
+      const name = sanitizeServerName(server.name)
+      if (name === '') {
+        results.push({ name: server.name, ok: false, error: '名称不含合法字符（A-Z a-z 0-9 _ -）' })
+        continue
+      }
+      if (Object.prototype.hasOwnProperty.call(map, name)) {
+        results.push({ name, ok: false, error: '已存在于目标配置' })
+        continue
+      }
+      map[name] = foreignToRawEntry(server)
+      results.push({ name, ok: true })
+    }
+    if (results.some((r) => r.ok)) {
+      await writeMcpDoc(filePath, doc)
+      await resync()
+    }
+    const imported = results.filter((r) => r.ok).length
+    return ok(`导入完成：${imported} 成功，${results.length - imported} 跳过。`, { results, scope, path: filePath })
+  }
+
   // ---- connection RPC surface（官方推荐的 Client→Host 私有通道） ----
 
   const endpoints = {
@@ -806,6 +1207,16 @@ export function apply(ctx) {
     'mcp/sync': { run: async (p) => sync(p.cwd, p.force === true) },
     'mcp/status': { run: async () => mcpStatus() },
     'mcp/setEnabled': { run: async (p) => setMcpEnabled(p.name, p.enabled === true) },
+    'mcp/save': { run: async (p) => saveMcpServer(p ?? {}) },
+    'mcp/get': { run: async (p) => getMcpServer(p?.name) },
+    'mcp/remove': { run: async (p) => removeMcpServer(p?.name) },
+    'mcp/import/scan': {
+      run: async () => {
+        const servers = await scanForeignMcp()
+        return ok(`${servers.length} importable server(s)`, { servers, existing: [...desired.keys()] })
+      },
+    },
+    'mcp/import/apply': { run: async (p) => applyImport(p ?? {}) },
     'mcp/reload': {
       run: async () => {
         if (lastCwd === null) return ok('No project synced yet — nothing to reload.')
