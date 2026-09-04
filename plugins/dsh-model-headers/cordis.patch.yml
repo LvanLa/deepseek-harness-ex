@@ -1,0 +1,5 @@
+# dsh-model-headers bundle layer.
+# 双面包：宿主半装进 host loader；dsh.client 声明把浏览器模块加进 Web roster。
+- insert:
+    - id: dsh-model-headers
+      name: 'dsh-model-headers'
