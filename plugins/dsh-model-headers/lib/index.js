@@ -27,6 +27,8 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 
 export const name = 'dsh-model-headers'
+// 保持空 inject：静态声明只影响自身 fiber 启动门槛，headless 无 webServer 会让
+// 插件永不装配（自愈/热加载失效）。RPC 的服务等待改用 apply 内 ctx.inject 回调。
 export const inject = []
 export { ensureCacheRetention, listConfiguredModels }
 
@@ -415,35 +417,41 @@ export function apply(ctx) {
     await loadRules()
     await ensureCacheRetention()
     await watchConfig()
-    console.log(`[dsh-model-headers] host ready: ${rules.length} rule(s), rpc '${RPC_CHANNEL}'`)
+    console.log(`[dsh-model-headers] host ready: ${rules.length} rule(s)`)
   })()
 
-  // connection 是 web profile 的服务，headless 没有 → 可选获取，取不到就跳过 RPC
-  //（fetch 钩子与配置文件热加载不依赖它）。ctx.get 绕过 inject 要求直读服务店。
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-  void (async () => {
-    let connection
-    for (let attempt = 0; attempt < 10; attempt++) {
-      connection = ctx.get?.('connection')
-      if (connection?.rpc?.handle) break
-      connection = undefined
-      await sleep(1000)
+  // ---- RPC（dsh v0.1.5 新传输模型）----
+  // 浏览器侧固定 POST /api/<endpoint>；/api 前缀路由由 core 的 connection
+  // 宿主插件用 webServer 挂载。插件通过 connection.fetch.register 注册精确
+  // POST 路由（fetchRoutes 优先于网关 interceptor，且注册过程不碰 webServer，
+  // 只需 inject connection）。信封：client-request {rpcId,method,payload} →
+  // server-response {rpcId,result:{ok,value|error}}。
+  const okResponse = (rpcId, result) => new Response(
+    JSON.stringify({ type: 'server-response', rpcId, result }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )
+  ctx.inject(['connection'], (svc) => {
+    for (const [name, action] of Object.entries(endpoints)) {
+      const path = `/api/${RPC_PREFIX}/${name}`
+      svc.connection.fetch.register({
+        path,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          let rpcId = ''
+          try {
+            const msg = await request.json()
+            rpcId = typeof msg?.rpcId === 'string' ? msg.rpcId : ''
+            const value = await action.run(msg?.payload ?? {})
+            return okResponse(rpcId, rpcOk(value))
+          } catch (e) {
+            return okResponse(rpcId, rpcFail(e2str(e)))
+          }
+        },
+      })
     }
-    if (!connection?.rpc?.handle) {
-      console.log('[dsh-model-headers] 无 connection 服务（headless）：RPC 关闭，注入钩子照常工作')
-      return
-    }
-    connection.rpc.handle(RPC_CHANNEL, async (endpoint, payload) => {
-      try {
-        const action = endpoints[endpoint]
-        if (action === undefined) return rpcFail(`unknown endpoint "${endpoint}"`)
-        return rpcOk(await action.run(payload ?? {}))
-      } catch (e) {
-        return rpcFail(e2str(e))
-      }
-    }, { authority: 'loopback' })
-    console.log(`[dsh-model-headers] rpc '${RPC_CHANNEL}' ready`)
-  })()
+    console.log(`[dsh-model-headers] rpc routes ready under /api/${RPC_PREFIX} (${Object.keys(endpoints).length} endpoints)`)
+  })
 
   // 文件监听随插件卸载关闭；fetch 钩子恢复原状（配合热重载）。
   ctx.effect(() => () => {
