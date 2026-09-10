@@ -109,7 +109,7 @@ const USER_INVOCABLE_KEY = 'user-invocable'
 const PIN_KEY = 'pinned'
 
 // RPC 通道与按项目 MCP 的命名空间。
-const RPC_CHANNEL = '/skill-mcp'
+const RPC_PREFIX = 'skill-mcp' // 挂在 /api/<prefix>/<endpoint> 下的精确 POST 路由
 const MCP_ENTRY_PREFIX = 'pmcp-'
 const MCP_CLIENT_NAME = '@deepseek-ai/dsh-mcp-client'
 
@@ -879,7 +879,9 @@ async function saveMcpDisabled(disabled) {
 // ---------------------------------------------------------------------------
 
 export const name = 'dsh-skill-mcp'
-export const inject = ['connection', 'loader', 'tools']
+// connection.rpc.handle 内部会通过本插件 ctx 访问 webServer 注册路由，
+// 新版 cordis 对未声明 inject 的服务访问直接抛错（旧版静默 undefined）
+export const inject = ['connection', 'loader', 'tools', 'webServer']
 
 export function apply(ctx) {
   // ---- MCP engine state ----
@@ -1225,15 +1227,36 @@ export function apply(ctx) {
     },
   }
 
-  ctx.connection.rpc.handle(RPC_CHANNEL, async (endpoint, payload) => {
-    try {
-      const action = endpoints[endpoint]
-      if (action === undefined) return rpcFail(`unknown endpoint "${endpoint}"`)
-      return rpcOk(await action.run(payload ?? {}))
-    } catch (e) {
-      return rpcFail(e?.message || String(e))
+  // ---- RPC（dsh v0.1.5 新传输模型）----
+  // 浏览器侧固定 POST /api/<endpoint>；/api 前缀路由由 core 挂载。插件用
+  // connection.fetch.register 注册精确 POST 路由（优先于网关 interceptor，
+  // 注册过程不碰 webServer，只需 inject connection）。信封：client-request
+  // {rpcId,method,payload} → server-response {rpcId,result:{ok,value|error}}。
+  const okResponse = (rpcId, result) => new Response(
+    JSON.stringify({ type: 'server-response', rpcId, result }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )
+  ctx.inject(['connection'], (c) => {
+    for (const [name, action] of Object.entries(endpoints)) {
+      c.connection.fetch.register({
+        path: `/api/${RPC_PREFIX}/${name}`,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          let rpcId = ''
+          try {
+            const msg = await request.json()
+            rpcId = typeof msg?.rpcId === 'string' ? msg.rpcId : ''
+            const value = await action.run(msg?.payload ?? {})
+            return okResponse(rpcId, rpcOk(value))
+          } catch (e) {
+            return okResponse(rpcId, rpcFail(e?.message || String(e)))
+          }
+        },
+      })
     }
-  }, { authority: 'loopback' })
+    console.log(`[dsh-skill-mcp] rpc routes ready under /api/${RPC_PREFIX} (${Object.keys(endpoints).length} endpoints)`)
+  })
 
   // 文件监听随插件卸载关闭。
   ctx.effect(() => () => {

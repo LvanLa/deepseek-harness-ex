@@ -22,8 +22,8 @@ window.__ModuleLoader__.load({
 
     const INJECT = ["slots", "locale", "workspaces", "connection"];
 
-    /** connection RPC 通道（与 host 半一致）。 */
-    const RPC_CHANNEL = "/skill-mcp";
+    /** dsh v0.1.5：浏览器侧统一走 /api 通道，endpoint 带插件前缀。 */
+    const RPC_PREFIX = "skill-mcp";
 
     let hostCtx = null;
 
@@ -32,7 +32,7 @@ window.__ModuleLoader__.load({
      * 返回的 value 保留业务形状（{ok, message, ...}）。
      */
     async function callApi(endpoint, body = {}) {
-      const result = await hostCtx.connection.rpc.call(RPC_CHANNEL, endpoint, body);
+      const result = await hostCtx.connection.rpc.call("/api", `${RPC_PREFIX}/${endpoint}`, body);
       if (result.ok) return result.value;
       throw new Error(result.error?.message || `rpc ${endpoint} failed`);
     }
