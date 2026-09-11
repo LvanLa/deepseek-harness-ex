@@ -1,6 +1,6 @@
 {
   "name": "dsh-skill-mcp",
-  "version": "0.4.2",
+  "version": "0.4.5",
   "description": "Management center: link skill directories into the user skills root (enable/disable/unlink/delete) and manage MCP servers — add/edit/delete, import from other agents (Claude Code/Codex/Cursor/Gemini CLI), auto-load each project's own MCP servers via the loader",
   "license": "BSD-3-Clause",
   "homepage": "https://github.com/LvanLa/deepseek-harness-ex/tree/master/plugins/dsh-skill-mcp",
@@ -43,7 +43,8 @@
         "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-connection",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-slots"
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ]
     }
   },
@@ -52,6 +53,7 @@
     "@deepseek-ai/dsh-client-runtime": "^0.1.1-rc.2",
     "@deepseek-ai/dsh-client-connection": "^0.1.1-rc.2",
     "@deepseek-ai/dsh-client-locale": "^0.1.1-rc.2",
-    "@deepseek-ai/dsh-client-ui-slots": "^0.1.1-rc.2"
+    "@deepseek-ai/dsh-client-ui-slots": "^0.1.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-workspace": "^0.1.1-rc.2"
   }
 }

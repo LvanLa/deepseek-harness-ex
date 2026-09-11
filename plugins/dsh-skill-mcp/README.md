@@ -1,11 +1,11 @@
 # dsh-skill-mcp
 
-DSH 技能与MCP插件（v0.2），两大功能：
+DSH 技能与MCP插件（v0.4），两大功能：
 
 1. **技能软链接管理**：把任意源目录下的技能目录**以目录联接（Windows 上是 junction，macOS/Linux 上是 symlink）批量链接进用户技能根目录 `~/.dsh/skills`**，让 DSH 直接加载它们；同时提供技能生命周期管理：启用/停用、取消链接、删除。
-2. **按项目自动加载 MCP**（v0.2 新增）：监测当前会话工作区，读取用户级 `~/.dsh/mcp.json` 与项目级 `<项目根>/.dsh/mcp.json`（回退 `<项目根>/.mcp.json`，Claude 格式），通过 loader **热加载 / 热卸载**该项目声明的 MCP 服务——每个项目自动带上自己的 MCP（如 quick-java 项目里的 codegraph）。
+2. **MCP 管理与按项目自动加载**：面板内可直接添加/编辑/删除 MCP 服务，或从其他 agent（Claude Code / Codex / Cursor / Gemini CLI）扫描导入；同时监测当前会话工作区，读取用户级 `~/.dsh/mcp.json` 与项目级 `<项目根>/.dsh/mcp.json`（回退 `<项目根>/.mcp.json`，Claude 格式），通过 loader **热加载 / 热卸载**该项目声明的 MCP 服务——每个项目自动带上自己的 MCP（如 quick-java 项目里的 codegraph）。
 
-设置弹窗里有 **技能与MCP** 页面（内部 tab 切换「技能 / MCP」），侧栏底部还有 **⚡ 技能与MCP** 快捷入口，两者打开的是同一个面板。
+入口在设置弹窗的 **技能与MCP** 页面，面板内部 tab 切换「技能 / MCP」。
 
 ## 安装
 
@@ -19,7 +19,7 @@ DSH 技能与MCP插件（v0.2），两大功能：
 dsh plugin --profile web add dsh-skill-mcp@latest
 ```
 
-装完硬刷新浏览器（Cmd/Ctrl+Shift+R）即可看到「技能与MCP」设置页与侧栏底部 ⚡ 入口（DSH 对 client 改动热加载；仅 host 半更新时需要重启 `dsh web`）。
+装完硬刷新浏览器（Cmd/Ctrl+Shift+R）即可在设置弹窗看到「技能与MCP」页面（DSH 对 client 改动热加载；host 半有更新时需重启 `dsh web`）。
 
 ### 方式二：让 DSH 自己装——把下面这段提示词发给任意一个 DSH 会话
 
@@ -40,7 +40,8 @@ dsh plugin --profile web add dsh-skill-mcp@latest
 | --- | --- |
 | 安装时 pnpm 拦截 `node-pty` 构建脚本（仅旧版 dshmarket ≤1.37 的依赖） | 在 `~/.dsh/profiles/web` 执行 `pnpm approve-builds --all` 放行后重跑安装 |
 | 装完看不到入口 | 硬刷新浏览器（Cmd/Ctrl+Shift+R）；host 半有改动时需重启 `dsh web` |
-| 设置页在但侧栏没有 ⚡ 按钮 | 检查宿主是否加载了客户端半边：package.json 的 `exports` 必须包含 `"./package.json"`，缺了会被静默丢弃 |
+| 设置弹窗里没有「技能与MCP」页 | 先硬刷新；仍没有则检查客户端半边是否被加载——package.json 的 `exports` 必须包含 `"./package.json"`，缺了会被静默丢弃 |
+| 宿主启动报 `loader entry failed` / `RPC_CHANNEL is not defined` | 运行副本（`~/.dsh/profiles/web/node_modules/dsh-skill-mcp`）版本过旧，与 dsh ≥ 0.1.5 不匹配；升级到 0.4.x 后重启 `dsh web` |
 
 ### 从源码安装（可选，替代 npm 方式）
 
@@ -126,15 +127,33 @@ dsh 原生格式（`{ "servers": { … } }` 或顶层直接是 name→config 映
 - 配置文件改动约 0.5 秒内自动生效（文件监听），无需重启；
 - tab 里可对每个服务热启停（写入 `~/.dsh/project-mcp-state.json`，重启后保持），状态点显示连接情况（绿=已连接、黄=加载中、红=失败、灰=停用）与工具数。
 
+### MCP 服务管理与跨 agent 导入（v0.3 新增）
+
+MCP tab 工具栏提供 **添加 / 导入 / 重新加载**：
+
+- **添加 / 编辑**：表单与 JSON 两种编辑方式（stdio / http 传输，支持 env、headers、args 等字段），写入作用域可选「全局」（`~/.dsh/mcp.json`）或「当前项目」（`<项目根>/.dsh/mcp.json`）；保存后立即 reconcile 热生效；
+- **删除**：二次确认后从所在配置文件移除并热卸载，按项目自动加载的条目不受影响；
+- **从其他 agent 导入**：扫描本机已有 agent 的 MCP 配置（纯读取，不改动原文件），按 agent 分组勾选导入，已存在的条目自动跳过：
+
+| agent | 扫描路径 |
+| --- | --- |
+| Claude Code | `~/.claude/settings.json`、`~/.claude.json`（后者覆盖同名） |
+| Cursor | `~/.cursor/mcp.json` |
+| Gemini CLI | `~/.gemini/settings.json`（`httpUrl` 归一为 http 传输） |
+| Codex | `~/.codex/config.toml` 的 `[mcp_servers.*]`（内置零依赖 TOML 子集解析） |
+
+导入时同样选择写入作用域（全局 / 当前项目）；SSE 等不支持的条目形状会被跳过。
+
 ## 界面
 
-- 设置页与侧栏快捷入口打开同一「技能与MCP」面板，顶部 tab 切换「技能 / MCP」；
+- 入口在设置弹窗的「技能与MCP」页，面板顶部 tab 切换「技能 / MCP」（无侧栏入口）；
 - 技能 tab：可搜索的技能列表（按名称/描述过滤；仅列表区滚动，头部固定），每行技能卡片带状态徽章（`linked`、`pinned`、`已停用`、`agent`）；
+- MCP tab：服务状态列表 + 工具栏（添加 / 导入 / 重新加载），添加/编辑表单与导入面板均为内联展开卡片，下拉菜单不嵌套滚动、编辑时不自动弹出；
 - 操作按颜色区分：启停 switch（绿=启用、灰=停用）、取消链接（蓝）、删除（红色悬停）、MCP 状态点（绿=已连接、黄=加载中、红=失败、灰=停用）。
 
 ## 技术说明
 
-- 宿主半边与客户端半边走 **connection RPC**（通道 `/skill-mcp`，`authority: 'loopback'`，官方推荐的 Client→Host 私有通道接缝），端点覆盖 `skills/*` 与 `mcp/*`；
+- 宿主半边与客户端半边走 **dsh v0.1.5 的 `/api` 传输模型**：宿主用 `connection.fetch.register` 注册 15 个精确 POST 路由 `/api/skill-mcp/<endpoint>`（fetchRoutes 优先于网关 interceptor；register 内部经 `owner.webServer.register` 落路由，因此调用方 fiber 链上必须同时有 `connection` 与 `webServer`——本插件静态 inject 已含二者），浏览器侧固定 POST 调用；信封为 client-request `{rpcId, method, payload}` → server-response `{rpcId, result:{ok, value | error}}`，端点覆盖 `skills/*` 与 `mcp/*`；
 - 按项目 MCP 通过 `ctx.loader` 把条目热加载为 `@deepseek-ai/dsh-mcp-client`（id 前缀 `pmcp-`），运行状态由 loader fiber 阶段 + 工具目录派生；
-- 客户端半边通过 `settings.section` 扩展点注册设置页，通过 `sidebar.footer.action` 插槽注册侧栏快捷按钮；
+- 客户端半边通过 `settings.section` 扩展点注册设置页（单一面板，不再注册侧栏入口）；
 - package.json 的 `exports` 必须包含 `"./package.json"`——宿主用 `require.resolve('<pkg>/package.json')` 定位客户端 bundle，缺了这一项客户端半边会被静默丢弃。

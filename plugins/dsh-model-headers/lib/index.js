@@ -16,8 +16,9 @@
  * dsh 原生请求头（x-client-request-id / session_id）在此之前已就位，作为
  * sessionId 取值来源。
  *
- * 管理：connection RPC 通道 '/model-headers'（loopback），配置文件 fs.watch
- * 热加载。每次实际注入追加一行到 ~/.dsh/model-headers.log 供核验（>5MB 截断）。
+ * 管理：dsh v0.1.5 传输模型下注册精确 POST 路由 /api/model-headers/*，
+ * 配置文件 fs.watch 热加载。每次实际注入追加一行到
+ * ~/.dsh/model-headers.log 供核验（>5MB 截断）。
  */
 
 import { watch as fsWatch } from 'node:fs'
@@ -37,7 +38,7 @@ const CONFIG_FILE = () => path.join(DSH_HOME(), 'model-headers.json')
 const LOG_FILE = () => path.join(DSH_HOME(), 'model-headers.log')
 const SETTINGS_FILE = () => path.join(DSH_HOME(), 'settings.yaml')
 const LOG_MAX_BYTES = 5 * 1024 * 1024
-const RPC_CHANNEL = '/model-headers'
+const RPC_PREFIX = 'model-headers' // 挂在 /api/<prefix>/<endpoint> 下的精确 POST 路由
 const GUARD = Symbol.for('dsh.model-headers.installed')
 
 const e2str = (e) => String(e?.message || e).slice(0, 160)
@@ -421,16 +422,20 @@ export function apply(ctx) {
   })()
 
   // ---- RPC（dsh v0.1.5 新传输模型）----
-  // 浏览器侧固定 POST /api/<endpoint>；/api 前缀路由由 core 的 connection
-  // 宿主插件用 webServer 挂载。插件通过 connection.fetch.register 注册精确
-  // POST 路由（fetchRoutes 优先于网关 interceptor，且注册过程不碰 webServer，
-  // 只需 inject connection）。信封：client-request {rpcId,method,payload} →
+  // 浏览器侧固定 POST /api/<endpoint>；插件用 connection.fetch.register
+  // 注册精确 POST 路由（fetchRoutes 优先于网关 interceptor）。register 内部
+  // 经 owner.webServer.register 落路由，故回调 fiber 链上需同时有
+  // connection 与 webServer。信封：client-request {rpcId,method,payload} →
   // server-response {rpcId,result:{ok,value|error}}。
   const okResponse = (rpcId, result) => new Response(
     JSON.stringify({ type: 'server-response', rpcId, result }),
     { status: 200, headers: { 'content-type': 'application/json' } },
   )
-  ctx.inject(['connection'], (svc) => {
+  // fetch.register 内部为 owner.effect(() => owner.webServer.register(route))，
+  // 解析的是本回调 fiber 作用域链上的 webServer——只 inject connection 会抛
+  // "cannot get property webServer without inject"。web profile 两者就绪即注册；
+  // headless 无 webServer 时回调静默等待（无需 HTTP 路由），插件本体仍正常装配。
+  ctx.inject(['connection', 'webServer'], (svc) => {
     for (const [name, action] of Object.entries(endpoints)) {
       const path = `/api/${RPC_PREFIX}/${name}`
       svc.connection.fetch.register({

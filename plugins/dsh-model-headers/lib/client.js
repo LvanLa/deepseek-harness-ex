@@ -4,7 +4,7 @@
  * 设置页 section「模型请求头」：
  *   - 规则卡片列表（双列）：启停开关 / 模型通配符 / 头摘要 / 编辑 / 删除（二次确认）
  *   - 添加·编辑弹框：模型下拉（combobox：点选 settings.yaml 现有模型 / 推导通配符 / 手输任意）+ 头键值行（值可插入 ${sessionId} 变量）
- *   - 通信：connection RPC 通道 '/model-headers'，信封 {ok, value | error{message}}
+ *   - 通信：dsh v0.1.5 的 /api 通道 POST /api/model-headers/*，信封 {ok, value | error{message}}
  * - 挂载点：settings.section 槽位（order 100，排在「技能与MCP」之后）。
  */
 window.__ModuleLoader__.load({

@@ -20,7 +20,9 @@ window.__ModuleLoader__.load({
     // 不可靠（jsx 为 undefined → "jsx is not a function"），createElement 最稳。
     const jsx = (type, props) => React.createElement(type, props);
 
-    const INJECT = ["slots", "locale", "workspaces", "connection"];
+    // dsh 0.1.5：原生目录选择器在 uiWorkspace 服务上（ctx.workspaces 是纯
+    // Workspace Controller，没有 pickDirectory）。
+    const INJECT = ["slots", "locale", "uiWorkspace", "connection"];
 
     /** dsh v0.1.5：浏览器侧统一走 /api 通道，endpoint 带插件前缀。 */
     const RPC_PREFIX = "skill-mcp";
@@ -1214,7 +1216,7 @@ window.__ModuleLoader__.load({
         ...props,
         fillHeight: true,
         // 注意要包一层箭头函数：方法内部依赖 this，摘下来传会丢绑定。
-        pickDirectory: ctx.workspaces ? () => ctx.workspaces.pickDirectory() : undefined,
+        pickDirectory: ctx.uiWorkspace ? () => ctx.uiWorkspace.pickDirectory() : undefined,
       })));
     };
 

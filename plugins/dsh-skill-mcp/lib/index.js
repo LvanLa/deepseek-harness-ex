@@ -1229,8 +1229,10 @@ export function apply(ctx) {
 
   // ---- RPC（dsh v0.1.5 新传输模型）----
   // 浏览器侧固定 POST /api/<endpoint>；/api 前缀路由由 core 挂载。插件用
-  // connection.fetch.register 注册精确 POST 路由（优先于网关 interceptor，
-  // 注册过程不碰 webServer，只需 inject connection）。信封：client-request
+  // connection.fetch.register 注册精确 POST 路由（优先于网关 interceptor）。
+  // 注意 register 内部为 owner.effect(() => owner.webServer.register(route))，
+  // 解析回调 fiber 链上的 webServer——本插件静态 inject 已含 webServer，子 fiber
+  // 天然继承。信封：client-request
   // {rpcId,method,payload} → server-response {rpcId,result:{ok,value|error}}。
   const okResponse = (rpcId, result) => new Response(
     JSON.stringify({ type: 'server-response', rpcId, result }),
@@ -1264,5 +1266,4 @@ export function apply(ctx) {
     watchers.clear()
   })
 
-  console.log(`[dsh-skill-mcp] host ready: connection RPC channel '${RPC_CHANNEL}' (skills + project MCP)`)
 }

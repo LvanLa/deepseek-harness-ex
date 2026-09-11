@@ -1,6 +1,6 @@
 {
   "name": "dsh-model-headers",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Per-model custom request headers: inject headers into LLM requests matched by model-name wildcard; values support fixed strings and the ${sessionId} variable. Managed from a settings-page UI.",
   "license": "BSD-3-Clause",
   "homepage": "https://github.com/LvanLa/deepseek-harness-ex/tree/master/plugins/dsh-model-headers",
