@@ -11,7 +11,7 @@ DSH 技能与MCP插件（v0.4），两大功能：
 
 **前置**：已装好 DSH（`dsh web` 能正常运行），Node.js ≥ 20、pnpm ≥ 10。
 
-**支持的 DSH 版本**：peer 依赖 `@deepseek-ai/dsh-client-* ^0.1.1-rc.2`（基于 DSH 0.1.1-rc.2 的客户端运行时适配）。
+**支持的 DSH 版本**：DSH ≥ 0.2.1（peer 依赖 `@deepseek-ai/dsh-client-* >=0.2.1-rc.2`，开区间不封顶；基于 0.1.5+ 的 `/api` 传输模型与客户端槽位体系，未来版本同模型直接可用）。
 
 ### 方式一：npm 安装
 
